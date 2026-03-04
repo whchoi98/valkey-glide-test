@@ -138,6 +138,48 @@ while (true) {
 }
 ```
 
+### 3-5. Read/Write 동작 흐름 (AZ_AFFINITY)
+
+Java Glide 클라이언트는 실제로 Valkey 클러스터에 Read와 Write를 모두 수행합니다.
+
+```java
+// Write (SET) → Primary 노드로 전송 (AZ 무관, Primary는 쓰기 전용)
+client.set("ping:" + podName, "count-" + count).get();
+
+// Read (GET) → AZ_AFFINITY에 의해 같은 AZ의 Replica 우선 읽기
+String val = client.get("ping:" + podName).get();
+```
+
+#### AZ-A Pod (glide-test-az-a) 기준 동작 예시
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  AZ-A (ap-northeast-2a)          AZ-B (ap-northeast-2b)     │
+│                                                              │
+│  ┌──────────────────┐            ┌──────────────────┐       │
+│  │ glide-test-az-a  │            │ Shard0001 Primary │       │
+│  │ (Glide Client)   │──SET──────▶│ Shard0002 Primary │       │
+│  │                   │  (Write)   └──────────────────┘       │
+│  │                   │                                        │
+│  │                   │            ┌──────────────────┐       │
+│  │                   │◀──GET─────│ Shard0001 Replica │       │
+│  │                   │  (Read)    │ Shard0002 Replica │       │
+│  └──────────────────┘  same-AZ   └──────────────────┘       │
+│                        우선 읽기    (AZ-A에 위치)              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| 동작 | 대상 노드 | 네트워크 경로 | 설명 |
+|------|-----------|--------------|------|
+| `client.set()` (Write) | Primary 노드 | Cross-AZ (AZ-A → AZ-B) | 쓰기는 항상 해당 키 슬롯의 Primary로 전송 |
+| `client.get()` (Read) | Replica 노드 | Same-AZ (AZ-A → AZ-A) | AZ_AFFINITY에 의해 같은 AZ의 Replica 우선 선택 |
+
+#### AZ_AFFINITY의 핵심 동작
+- **정상 시**: Read 트래픽을 같은 AZ의 Replica로 라우팅하여 cross-AZ 네트워크 비용 절감 및 지연시간 최소화
+- **AZ 장애 시**: Glide 클라이언트가 클러스터 토폴로지 변경을 자동 감지하고, 다른 AZ의 노드로 failover하여 Read/Write를 계속 처리
+- **Failover 감지**: 200ms 간격 연속 SET/GET 루프에서 에러 발생 구간의 타임스탬프로 failover 소요 시간을 정밀 측정
+
 ---
 
 ## 4. K8s Pod 배포
@@ -254,6 +296,41 @@ kubectl logs -f glide-test-az-b -n valkey-test
 
 # 터미널 3: FIS 실험 시작
 ./5-run-fis-test.sh a
+```
+
+### 로그 모니터링 상세 설명
+
+`kubectl logs -f` 명령으로 확인되는 로그는 GlideTest.java가 실제로 Valkey 클러스터에 Read/Write를 수행한 결과입니다.
+
+#### 정상 동작 시 로그
+```
+[2026-03-04T16:55:07.635Z] [70] SET/GET ping:glide-test-az-a = count-70
+```
+- `client.set()` → Primary 노드에 Write 성공
+- `client.get()` → 같은 AZ의 Replica에서 Read 성공
+- 200ms 간격으로 연속 출력
+
+#### AZ 장애 발생 시 로그
+```
+[2026-03-04T16:55:07.635Z] [70] SET/GET ping:glide-test-az-a = count-70   ← 마지막 정상
+[2026-03-04T16:55:08.242Z] [71] ERROR: TimeoutException: timed out         ← 장애 감지
+[2026-03-04T16:55:08.450Z] [72] ERROR: TimeoutException: timed out         ← failover 진행 중
+...
+[2026-03-04T16:55:15.123Z] [105] SET/GET ping:glide-test-az-a = count-105  ← 복구 완료
+```
+- ERROR 구간: Glide가 클러스터 토폴로지 변경을 감지하고 다른 AZ의 노드로 failover하는 중
+- 복구 후: 새로운 Primary/Replica 구성으로 Read/Write 재개
+
+#### 로그 수동 분석 명령
+```bash
+# ERROR만 필터링
+kubectl logs glide-test-az-a -n valkey-test | grep ERROR
+
+# 에러 건수 확인
+kubectl logs glide-test-az-a -n valkey-test | grep -c ERROR
+
+# 에러 전후 구간 확인 (첫 에러 시점 기준 앞뒤 5줄)
+kubectl logs glide-test-az-a -n valkey-test | grep -B5 -A5 "ERROR" | head -30
 ```
 
 ---
